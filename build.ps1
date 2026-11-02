@@ -26,6 +26,9 @@ $references = @(
     (Join-Path $frameworkDir 'System.Core.dll'),
     (Join-Path $frameworkDir 'System.Drawing.dll'),
     (Join-Path $frameworkDir 'System.Windows.Forms.dll'),
+    (Join-Path $frameworkDir 'System.Net.Http.dll'),
+    (Join-Path $frameworkDir 'System.IO.Compression.dll'),
+    (Join-Path $frameworkDir 'System.IO.Compression.FileSystem.dll'),
     (Join-Path $frameworkDir 'System.Runtime.WindowsRuntime.dll'),
     (Join-Path $facadeDir 'System.Runtime.dll'),
     (Join-Path $facadeDir 'System.Runtime.InteropServices.WindowsRuntime.dll')

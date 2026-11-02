@@ -2,6 +2,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
@@ -9,6 +10,12 @@ using WinFormsTimer = System.Windows.Forms.Timer;
 
 namespace QuickScreenshot
 {
+    internal enum OcrChannel
+    {
+        Windows = 0,
+        Paddle = 1
+    }
+
     internal sealed class OcrForm : Form
     {
         private const int WM_NCLBUTTONDOWN = 0xA1;
@@ -16,6 +23,7 @@ namespace QuickScreenshot
 
         private readonly float _scale;
         private readonly Rectangle _sourceSelection;
+        private readonly Bitmap _sourceBitmap;
         private readonly TextBox _textBox;
         private readonly WinFormsTimer _spinnerTimer;
         private readonly Font _fontTitle;
@@ -29,7 +37,12 @@ namespace QuickScreenshot
         private Rectangle _closeBounds;
         private Rectangle _xBounds;
         private Rectangle _headerBounds;
+        private readonly Rectangle[] _channelBounds = new Rectangle[2];
+        private Rectangle _channelGroupBounds;
 
+        private OcrChannel _channel;
+        private int _hoverChannel = -1;
+        private int _requestVersion;
         private bool _loading;
         private bool _hasText;
         private bool _hoverCopy;
@@ -42,12 +55,16 @@ namespace QuickScreenshot
         private bool _copied;
         private int _spinnerAngle;
 
-        public OcrForm(Rectangle sourceSelection, float baseScale)
+        public OcrForm(Rectangle sourceSelection, float baseScale, Bitmap sourceBitmap)
         {
             _sourceSelection = sourceSelection;
             _scale = CalculateScale(sourceSelection, baseScale);
+            _sourceBitmap = sourceBitmap == null ? null : new Bitmap(sourceBitmap);
+            _channel = PaddleOcr.IsInstalled() ? OcrChannel.Paddle : OcrChannel.Windows;
             _loading = true;
-            _subtitle = "Windows 本机 OCR · 正在读取屏幕文字";
+            _subtitle = _channel == OcrChannel.Paddle
+                ? "PaddleOCR · 正在识别"
+                : "Windows 本机 OCR · 正在识别";
             _statusText = "正在识别文字";
             _statusColor = AppPalette.SubInk;
 
@@ -188,6 +205,31 @@ namespace QuickScreenshot
                 (int)Math.Round((headerHeight - xSize) / 2f),
                 xSize, xSize);
 
+            int groupHeight = (int)Math.Round(30f * _scale);
+            int groupWidth = (int)Math.Round(ClientSize.Width * 0.30f);
+            int groupLeft = (int)Math.Round(ClientSize.Width * 0.42f);
+            int maxRight = _xBounds.Left - (int)Math.Round(14f * _scale);
+            if (groupLeft + groupWidth > maxRight)
+            {
+                groupWidth = Math.Max((int)Math.Round(150f * _scale),
+                    maxRight - groupLeft);
+            }
+
+            _channelGroupBounds = new Rectangle(
+                groupLeft,
+                (int)Math.Round((headerHeight - groupHeight) / 2f),
+                groupWidth,
+                groupHeight);
+            int inner = Math.Max(1, (int)Math.Round(2f * _scale));
+            int gap = Math.Max(1, (int)Math.Round(2f * _scale));
+            int usable = groupWidth - inner * 2 - gap;
+            int windowsWidth = (int)Math.Round(usable * 0.45f);
+            int paddleWidth = usable - windowsWidth;
+            _channelBounds[0] = new Rectangle(groupLeft + inner, _channelGroupBounds.Top + inner,
+                windowsWidth, groupHeight - inner * 2);
+            _channelBounds[1] = new Rectangle(_channelBounds[0].Right + gap,
+                _channelGroupBounds.Top + inner, paddleWidth, groupHeight - inner * 2);
+
             float buttonHeight = 34f * _scale;
             float copyWidth = 108f * _scale;
             float closeWidth = 76f * _scale;
@@ -246,12 +288,15 @@ namespace QuickScreenshot
                 8f * _scale);
 
             float left = 23f * _scale;
+            float titleWidth = Math.Max(90f * _scale, _channelGroupBounds.Left - left - 12f * _scale);
             DrawUtil.DrawText(g, "识别文字", _fontTitle, AppPalette.Ink,
-                new RectangleF(left, 15f * _scale, ClientSize.Width - left * 2f - 44f * _scale, 27f * _scale),
+                new RectangleF(left, 15f * _scale, titleWidth, 27f * _scale),
                 StringAlignment.Near, StringAlignment.Center, true);
             DrawUtil.DrawText(g, _subtitle, _fontSubtitle, AppPalette.SubInk,
-                new RectangleF(left, 42f * _scale, ClientSize.Width - left * 2f - 44f * _scale, 20f * _scale),
+                new RectangleF(left, 42f * _scale, titleWidth, 20f * _scale),
                 StringAlignment.Near, StringAlignment.Center, true);
+
+            DrawChannelSelector(g);
 
             if (_hoverX)
             {
@@ -273,6 +318,43 @@ namespace QuickScreenshot
 
             DrawFooter(g);
             DrawBorder(g);
+        }
+
+        private void DrawChannelSelector(Graphics g)
+        {
+            DrawUtil.FillRounded(g, Color.FromArgb(244, 246, 251),
+                new RectangleF(_channelGroupBounds.X, _channelGroupBounds.Y,
+                    _channelGroupBounds.Width, _channelGroupBounds.Height), 8f * _scale);
+            DrawUtil.DrawRounded(g, Color.FromArgb(220, 226, 236), 1f,
+                new RectangleF(_channelGroupBounds.X, _channelGroupBounds.Y,
+                    _channelGroupBounds.Width - 1, _channelGroupBounds.Height - 1), 8f * _scale);
+
+            string[] labels = new string[] { "Windows", "PaddleOCR" };
+            for (int i = 0; i < 2; i++)
+            {
+                bool selected = (int)_channel == i;
+                bool available = i != 1 || PaddleOcr.IsInstalled();
+                if (selected)
+                {
+                    DrawUtil.FillRounded(g, AppPalette.Accent,
+                        new RectangleF(_channelBounds[i].X, _channelBounds[i].Y,
+                            _channelBounds[i].Width, _channelBounds[i].Height), 6f * _scale);
+                }
+                else if (_hoverChannel == i && available)
+                {
+                    DrawUtil.FillRounded(g, Color.FromArgb(232, 237, 247),
+                        new RectangleF(_channelBounds[i].X, _channelBounds[i].Y,
+                            _channelBounds[i].Width, _channelBounds[i].Height), 6f * _scale);
+                }
+
+                Color textColor = selected
+                    ? Color.White
+                    : (available ? AppPalette.Ink : Color.FromArgb(168, 176, 190));
+                DrawUtil.DrawText(g, labels[i], _fontSubtitle, textColor,
+                    new RectangleF(_channelBounds[i].X, _channelBounds[i].Y,
+                        _channelBounds[i].Width, _channelBounds[i].Height),
+                    StringAlignment.Center, StringAlignment.Center, true);
+            }
         }
 
         private void DrawFooter(Graphics g)
@@ -375,7 +457,160 @@ namespace QuickScreenshot
             }
         }
 
+        private int ChannelAt(Point point)
+        {
+            for (int i = 0; i < _channelBounds.Length; i++)
+            {
+                if (_channelBounds[i].Contains(point))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private string GetChannelLabel()
+        {
+            return _channel == OcrChannel.Paddle ? "PaddleOCR" : "Windows 本机 OCR";
+        }
+
+        private void SwitchChannel(OcrChannel channel)
+        {
+            if (channel == _channel)
+            {
+                return;
+            }
+
+            if (channel == OcrChannel.Paddle && !PaddleOcr.IsInstalled())
+            {
+                _statusText = "PaddleOCR 未安装，请先从托盘菜单下载增强 OCR";
+                _statusColor = AppPalette.Danger;
+                Invalidate();
+                return;
+            }
+
+            _channel = channel;
+            _loading = true;
+            _copied = false;
+            _statusText = "正在使用" + GetChannelLabel() + "重新识别";
+            _statusColor = AppPalette.SubInk;
+            _subtitle = GetChannelLabel() + " · 正在识别";
+            _spinnerTimer.Start();
+            Invalidate();
+
+            int version = ++_requestVersion;
+            OcrChannel requested = channel;
+            ThreadPool.QueueUserWorkItem(delegate(object state)
+            {
+                OcrOutcome outcome;
+                try
+                {
+                    outcome = RecognizeForChannel(requested);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.WriteException("OCR channel", ex);
+                    outcome = new OcrOutcome();
+                    outcome.Error = "文字识别失败：\n\n" + ex.Message;
+                }
+
+                if (IsDisposed || Disposing)
+                {
+                    return;
+                }
+
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (version != _requestVersion || IsDisposed || Disposing)
+                        {
+                            return;
+                        }
+
+                        ApplyOutcome(outcome);
+                    }));
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            });
+        }
+
+        private OcrOutcome RecognizeForChannel(OcrChannel channel)
+        {
+            if (_sourceBitmap == null)
+            {
+                return ChannelError("没有可重新识别的截图。");
+            }
+
+            string culture = CultureInfo.CurrentUICulture.Name;
+            if (channel == OcrChannel.Paddle)
+            {
+                if (!PaddleOcr.IsInstalled())
+                {
+                    return ChannelError("PaddleOCR 未安装，请先从托盘菜单下载增强 OCR。");
+                }
+
+                return FromPaddleResult(PaddleOcr.Recognize(_sourceBitmap));
+            }
+
+            return WindowsOcr.Recognize(_sourceBitmap, culture);
+        }
+
+        private static OcrOutcome FromPaddleResult(PaddleOcrResult result)
+        {
+            OcrOutcome outcome = new OcrOutcome();
+            if (result == null || !result.Success)
+            {
+                outcome.Error = result == null
+                    ? "PaddleOCR 没有返回结果。"
+                    : (string.IsNullOrEmpty(result.Error)
+                        ? "PaddleOCR 没有识别到文字。"
+                        : result.Error);
+                outcome.LanguageName = "PaddleOCR";
+                return outcome;
+            }
+
+            outcome.Success = true;
+            outcome.Text = result.Text;
+            outcome.LineCount = result.LineCount;
+            outcome.CharCount = result.CharCount;
+            outcome.LanguageName = "PaddleOCR（本地增强）";
+            outcome.SuggestEnglishOcr = false;
+            return outcome;
+        }
+
+        private static OcrOutcome ChannelError(string message)
+        {
+            OcrOutcome outcome = new OcrOutcome();
+            outcome.Error = message;
+            return outcome;
+        }
+
         internal void SetOutcome(OcrOutcome outcome)
+        {
+            if (_requestVersion != 0)
+            {
+                return;
+            }
+
+            if (outcome != null && outcome.Success && !string.IsNullOrEmpty(outcome.LanguageName))
+            {
+                _channel = outcome.LanguageName.IndexOf(
+                    "PaddleOCR", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? OcrChannel.Paddle
+                    : OcrChannel.Windows;
+            }
+
+            ApplyOutcome(outcome);
+        }
+
+        private void ApplyOutcome(OcrOutcome outcome)
         {
             if (IsDisposed || Disposing)
             {
@@ -391,7 +626,7 @@ namespace QuickScreenshot
                 _hasText = false;
                 _statusText = "识别失败";
                 _statusColor = AppPalette.Danger;
-                _subtitle = "Windows 本机 OCR · 无法处理这张图片";
+                _subtitle = GetChannelLabel() + " · 无法处理这张图片";
                 _textBox.ForeColor = AppPalette.SubInk;
                 _textBox.Text = "文字识别没有返回结果，请稍后重试。";
             }
@@ -400,7 +635,7 @@ namespace QuickScreenshot
                 _hasText = false;
                 _statusText = "未识别到文字";
                 _statusColor = AppPalette.Danger;
-                _subtitle = "Windows 本机 OCR" + (string.IsNullOrEmpty(outcome.LanguageName) ? string.Empty : " · " + outcome.LanguageName);
+                _subtitle = GetChannelLabel() + " · 无法处理这张图片";
                 _textBox.ForeColor = Color.FromArgb(139, 63, 63);
                 _textBox.Text = outcome.Error ?? "没有识别到文字。请重新框选后再试。";
             }
@@ -415,7 +650,7 @@ namespace QuickScreenshot
                 }
 
                 _statusColor = AppPalette.SubInk;
-                _subtitle = "Windows 本机 OCR" + (string.IsNullOrEmpty(outcome.LanguageName) ? string.Empty : " · " + outcome.LanguageName);
+                _subtitle = BuildSubtitle(outcome);
                 _textBox.ForeColor = AppPalette.Ink;
                 _textBox.Text = _textValue;
                 try
@@ -430,6 +665,18 @@ namespace QuickScreenshot
             }
 
             Invalidate();
+        }
+
+        private string BuildSubtitle(OcrOutcome outcome)
+        {
+            string language = outcome == null ? string.Empty : (outcome.LanguageName ?? string.Empty);
+            if (_channel == OcrChannel.Paddle)
+            {
+                return "PaddleOCR · 本地增强";
+            }
+
+            return "Windows 本机 OCR" +
+                (language.Length == 0 ? string.Empty : " · " + language);
         }
 
         private void CopyText()
@@ -482,8 +729,9 @@ namespace QuickScreenshot
             bool newHoverCopy = _hasText && _copyBounds.Contains(e.Location);
             bool newHoverClose = _closeBounds.Contains(e.Location);
             bool newHoverX = _xBounds.Contains(e.Location);
+            int newHoverChannel = ChannelAt(e.Location);
 
-            if (newHoverCopy || newHoverClose || newHoverX)
+            if (newHoverCopy || newHoverClose || newHoverX || newHoverChannel >= 0)
             {
                 Cursor = Cursors.Hand;
             }
@@ -496,11 +744,13 @@ namespace QuickScreenshot
                 Cursor = Cursors.Default;
             }
 
-            if (newHoverCopy != _hoverCopy || newHoverClose != _hoverClose || newHoverX != _hoverX)
+            if (newHoverCopy != _hoverCopy || newHoverClose != _hoverClose ||
+                newHoverX != _hoverX || newHoverChannel != _hoverChannel)
             {
                 _hoverCopy = newHoverCopy;
                 _hoverClose = newHoverClose;
                 _hoverX = newHoverX;
+                _hoverChannel = newHoverChannel;
                 Invalidate();
             }
         }
@@ -511,6 +761,7 @@ namespace QuickScreenshot
             _hoverCopy = false;
             _hoverClose = false;
             _hoverX = false;
+            _hoverChannel = -1;
             Cursor = Cursors.Default;
             Invalidate();
         }
@@ -526,6 +777,21 @@ namespace QuickScreenshot
             if (_xBounds.Contains(e.Location))
             {
                 Close();
+                return;
+            }
+
+            int channel = ChannelAt(e.Location);
+            if (channel >= 0)
+            {
+                if (channel == (int)OcrChannel.Paddle && !PaddleOcr.IsInstalled())
+                {
+                    _statusText = "PaddleOCR 未安装，请先从托盘菜单下载增强 OCR";
+                    _statusColor = AppPalette.Danger;
+                    Invalidate();
+                    return;
+                }
+
+                SwitchChannel((OcrChannel)channel);
                 return;
             }
 
@@ -552,6 +818,11 @@ namespace QuickScreenshot
         {
             _spinnerTimer.Stop();
             _spinnerTimer.Dispose();
+            if (_sourceBitmap != null)
+            {
+                _sourceBitmap.Dispose();
+            }
+
             _fontTitle.Dispose();
             _fontSubtitle.Dispose();
             _fontStatus.Dispose();

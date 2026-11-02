@@ -2988,7 +2988,7 @@ namespace QuickScreenshot
                 throw;
             }
 
-            OcrForm form = new OcrForm(cropScreen, _uiScale);
+            OcrForm form = new OcrForm(cropScreen, _uiScale, crop);
             _ocrForm = form;
             form.FormClosed += delegate
             {
@@ -3006,7 +3006,22 @@ namespace QuickScreenshot
                 OcrOutcome outcome;
                 try
                 {
-                    outcome = WindowsOcr.Recognize(crop, CultureInfo.CurrentUICulture.Name);
+                    // Preferred channel: PaddleOCR when its optional pack is
+                    // installed, otherwise the Windows recognizer.
+                    outcome = null;
+                    if (PaddleOcr.IsInstalled())
+                    {
+                        PaddleOcrResult enhanced = PaddleOcr.Recognize(crop);
+                        if (enhanced.Success && !string.IsNullOrEmpty(enhanced.Text))
+                        {
+                            outcome = PaddleOcr.ToOutcome(enhanced);
+                        }
+                    }
+
+                    if (outcome == null)
+                    {
+                        outcome = WindowsOcr.Recognize(crop, CultureInfo.CurrentUICulture.Name);
+                    }
                 }
                 catch (Exception ex)
                 {

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
@@ -294,14 +295,22 @@ namespace QuickScreenshot
         private readonly NotifyIcon _notifyIcon;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _startupItem;
+        private readonly ToolStripMenuItem _installOcrItem;
+        private readonly ToolStripMenuItem _enhanceOcrItem;
         private readonly ToolStripMenuItem _retryHotkeyItem;
         private readonly HotkeyWindow _hotkeyWindow;
         private readonly Icon _trayIcon;
         private readonly WinFormsTimer _captureTimer;
         private readonly WinFormsTimer _firstRunTimer;
+        private readonly WinFormsTimer _ocrInstallTimer;
         private readonly List<PinForm> _pins = new List<PinForm>();
         private CaptureForm _captureForm;
         private RecordingForm _recordingForm;
+        private string _ocrInstallStatusPath;
+        private string _ocrInstallScriptPath;
+        private DateTime _ocrInstallStarted;
+        private bool _ocrInstallInProgress;
+        private bool _ocrInstallSucceeded;
         private bool _exitRequested;
         private bool _disposed;
 
@@ -329,6 +338,16 @@ namespace QuickScreenshot
             _startupItem.Click += OnStartupClicked;
             _menu.Items.Add(_startupItem);
 
+            _installOcrItem = new ToolStripMenuItem("安装文字识别 OCR");
+            _installOcrItem.Visible = !WindowsOcr.IsRecognizerInstalled("en");
+            _installOcrItem.Click += OnInstallOcrClicked;
+            _menu.Items.Add(_installOcrItem);
+
+            _enhanceOcrItem = new ToolStripMenuItem("下载增强 OCR（PaddleOCR）");
+            _enhanceOcrItem.Visible = !PaddleOcr.IsInstalled();
+            _enhanceOcrItem.Click += OnEnhanceOcrClicked;
+            _menu.Items.Add(_enhanceOcrItem);
+
             _retryHotkeyItem = new ToolStripMenuItem("重新注册热键");
             _retryHotkeyItem.Visible = false;
             _retryHotkeyItem.Click += OnRetryHotkeyClicked;
@@ -348,6 +367,9 @@ namespace QuickScreenshot
             {
                 // Keep the check mark in sync with the actual HKCU Run entry.
                 _startupItem.Checked = StartupManager.IsEnabled();
+                _installOcrItem.Visible = !_ocrInstallSucceeded &&
+                    !WindowsOcr.IsRecognizerInstalled("en");
+                _enhanceOcrItem.Visible = !PaddleOcr.IsInstalled();
                 _retryHotkeyItem.Visible = !_hotkeyWindow.IsRegistered;
             };
 
@@ -379,6 +401,10 @@ namespace QuickScreenshot
 
             _captureTimer = new WinFormsTimer();
             _captureTimer.Tick += OnCaptureTimerTick;
+
+            _ocrInstallTimer = new WinFormsTimer();
+            _ocrInstallTimer.Interval = 2000;
+            _ocrInstallTimer.Tick += OnOcrInstallTimerTick;
 
             _firstRunTimer = new WinFormsTimer();
             _firstRunTimer.Interval = 800;
@@ -596,6 +622,282 @@ namespace QuickScreenshot
             }
         }
 
+        private void OnEnhanceOcrClicked(object sender, EventArgs e)
+        {
+            if (PaddleOcr.IsInstalled())
+            {
+                _enhanceOcrItem.Visible = false;
+                return;
+            }
+
+            DialogResult answer = MessageBox.Show(
+                "增强 OCR 使用 PaddleOCR 本地模型，截图不会上传。\n\n" +
+                "需要下载约 170 MB，安装后占用约 350 MB。\n" +
+                "仅在需要更高识别精度时使用。\n\n" +
+                "现在下载并安装吗？",
+                "下载增强 OCR",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (answer != DialogResult.Yes)
+            {
+                return;
+            }
+
+            using (OcrPackForm form = new OcrPackForm())
+            {
+                form.ShowDialog();
+                if (form.Success)
+                {
+                    _enhanceOcrItem.Visible = false;
+                    ShowBalloon(
+                        "增强 OCR 安装完成",
+                        "PaddleOCR 已启用，文字识别会自动使用更高精度结果。",
+                        ToolTipIcon.Info,
+                        6000);
+                }
+                else if (!string.IsNullOrEmpty(form.Error))
+                {
+                    MessageBox.Show(
+                        "增强 OCR 安装失败：\n\n" + form.Error,
+                        "QuickScreenshot",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
+        }
+
+        private void OnInstallOcrClicked(object sender, EventArgs e)
+        {
+            if (_ocrInstallInProgress)
+            {
+                ShowBalloon(
+                    "正在安装文字识别 OCR",
+                    "请等待当前安装结束。",
+                    ToolTipIcon.Info,
+                    3000);
+                return;
+            }
+
+            if (WindowsOcr.IsRecognizerInstalled("en"))
+            {
+                _ocrInstallSucceeded = true;
+                _installOcrItem.Visible = false;
+                ShowBalloon("文字识别 OCR", "英语 OCR 已经安装。", ToolTipIcon.Info, 3000);
+                return;
+            }
+
+            string statusPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                "QuickScreenshot",
+                "ocr-install.status");
+            string scriptPath = Path.Combine(
+                Path.GetTempPath(),
+                "QuickScreenshot-install-ocr.ps1");
+
+            try
+            {
+                File.WriteAllText(
+                    scriptPath,
+                    BuildOcrInstallScript(statusPath),
+                    new System.Text.UTF8Encoding(true));
+
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.System),
+                    @"WindowsPowerShell\v1.0\powershell.exe");
+                startInfo.Arguments =
+                    "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" +
+                    scriptPath + "\"";
+                startInfo.UseShellExecute = true;
+                startInfo.Verb = "runas";
+                startInfo.WindowStyle = ProcessWindowStyle.Hidden;
+                Process.Start(startInfo);
+
+                _ocrInstallStatusPath = statusPath;
+                _ocrInstallScriptPath = scriptPath;
+                _ocrInstallStarted = DateTime.UtcNow;
+                _ocrInstallInProgress = true;
+                _installOcrItem.Text = "正在安装文字识别 OCR...";
+                _installOcrItem.Enabled = false;
+                _ocrInstallTimer.Start();
+                ShowBalloon(
+                    "安装文字识别 OCR",
+                    "请在 UAC 提示中点击“是”。安装会自动从 Windows Update 下载并完成。",
+                    ToolTipIcon.Info,
+                    6000);
+            }
+            catch (Win32Exception ex)
+            {
+                TryDeleteFile(scriptPath);
+                ResetOcrInstallUi();
+                if (ex.NativeErrorCode == 1223)
+                {
+                    ShowBalloon(
+                        "已取消安装",
+                        "没有安装文字识别 OCR。",
+                        ToolTipIcon.Info,
+                        3000);
+                }
+                else
+                {
+                    ShowOcrInstallFailure(ex.Message);
+                }
+            }
+            catch (Exception ex)
+            {
+                TryDeleteFile(scriptPath);
+                ResetOcrInstallUi();
+                AppLog.WriteException("Install OCR", ex);
+                ShowOcrInstallFailure(ex.Message);
+            }
+        }
+
+        private static string BuildOcrInstallScript(string statusPath)
+        {
+            string safeStatus = (statusPath ?? string.Empty).Replace("'", "''");
+            return
+                "$ErrorActionPreference = 'Stop'\r\n" +
+                "$status = '" + safeStatus + "'\r\n" +
+                "New-Item -ItemType Directory -Force -Path (Split-Path -Parent $status) | Out-Null\r\n" +
+                "try {\r\n" +
+                "  'INSTALLING' | Set-Content -Path $status -Encoding UTF8\r\n" +
+                "  Add-WindowsCapability -Online -Name 'Language.Basic~~~en-US~0.0.1.0' " +
+                "-ErrorAction Stop | Out-Null\r\n" +
+                "  Add-WindowsCapability -Online -Name 'Language.OCR~~~en-US~0.0.1.0' " +
+                "-ErrorAction Stop | Out-Null\r\n" +
+                "  'OK' | Set-Content -Path $status -Encoding UTF8\r\n" +
+                "} catch {\r\n" +
+                "  ('ERROR ' + $_.Exception.Message) | Set-Content -Path $status -Encoding UTF8\r\n" +
+                "  exit 1\r\n" +
+                "}\r\n";
+        }
+
+        private void OnOcrInstallTimerTick(object sender, EventArgs e)
+        {
+            if (!_ocrInstallInProgress)
+            {
+                _ocrInstallTimer.Stop();
+                return;
+            }
+
+            // Add-WindowsCapability can finish without writing OK (for example
+            // when the elevated host is closed). The recognizer itself is the
+            // reliable completion signal.
+            if (WindowsOcr.IsRecognizerInstalled("en"))
+            {
+                CompleteOcrInstall(true, string.Empty);
+                return;
+            }
+
+            if ((DateTime.UtcNow - _ocrInstallStarted).TotalMinutes > 20)
+            {
+                CompleteOcrInstall(false, "安装超时。请检查网络和 Windows Update 后重试。");
+                return;
+            }
+
+            try
+            {
+                if (string.IsNullOrEmpty(_ocrInstallStatusPath) ||
+                    !File.Exists(_ocrInstallStatusPath))
+                {
+                    return;
+                }
+
+                if (File.GetLastWriteTimeUtc(_ocrInstallStatusPath) <
+                    _ocrInstallStarted.AddSeconds(-3))
+                {
+                    return;
+                }
+
+                string status = File.ReadAllText(_ocrInstallStatusPath).Trim();
+                if (status.StartsWith("OK", StringComparison.OrdinalIgnoreCase))
+                {
+                    CompleteOcrInstall(true, string.Empty);
+                }
+                else if (status.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase))
+                {
+                    string detail = status.Length > 5 ? status.Substring(5).Trim() : string.Empty;
+                    CompleteOcrInstall(false, detail);
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private void CompleteOcrInstall(bool success, string detail)
+        {
+            _ocrInstallTimer.Stop();
+            _ocrInstallInProgress = false;
+            _ocrInstallSucceeded = success;
+            _installOcrItem.Text = "安装文字识别 OCR";
+            _installOcrItem.Enabled = true;
+            _installOcrItem.Visible = !success && !WindowsOcr.IsRecognizerInstalled("en");
+            TryDeleteFile(_ocrInstallScriptPath);
+            _ocrInstallScriptPath = null;
+
+            if (success)
+            {
+                bool installed = WindowsOcr.IsRecognizerInstalled("en");
+                ShowBalloon(
+                    "文字识别 OCR 安装完成",
+                    installed
+                        ? "英语 OCR 已经可用。"
+                        : "安装完成，请重启 QuickScreenshot 后生效。",
+                    ToolTipIcon.Info,
+                    6000);
+            }
+            else
+            {
+                ShowOcrInstallFailure(detail);
+            }
+        }
+
+        private void ShowOcrInstallFailure(string detail)
+        {
+            string text =
+                "自动安装文字识别 OCR 失败。\n\n" +
+                "请手动打开：\n" +
+                "设置 → 时间和语言 → 语言和区域 → 英语 → 语言选项 → 可选语言功能 → " +
+                "光学字符识别。\n\n" +
+                "也可以稍后重试。";
+            if (!string.IsNullOrEmpty(detail))
+            {
+                string shortDetail = detail.Length > 400 ? detail.Substring(0, 400) : detail;
+                text += "\n\n错误信息：" + shortDetail;
+            }
+
+            MessageBox.Show(
+                text,
+                "QuickScreenshot",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        private void ResetOcrInstallUi()
+        {
+            _ocrInstallTimer.Stop();
+            _ocrInstallInProgress = false;
+            _installOcrItem.Text = "安装文字识别 OCR";
+            _installOcrItem.Enabled = true;
+            _installOcrItem.Visible = !_ocrInstallSucceeded &&
+                !WindowsOcr.IsRecognizerInstalled("en");
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
+            }
+        }
+
         private void OnRetryHotkeyClicked(object sender, EventArgs e)
         {
             bool ok = _hotkeyWindow.TryRegister();
@@ -672,6 +974,7 @@ namespace QuickScreenshot
             _exitRequested = true;
             _captureTimer.Stop();
             _firstRunTimer.Stop();
+            _ocrInstallTimer.Stop();
 
             if (_captureForm != null && !_captureForm.IsDisposed)
             {
@@ -741,6 +1044,7 @@ namespace QuickScreenshot
                     _trayIcon.Dispose();
                     _captureTimer.Dispose();
                     _firstRunTimer.Dispose();
+                    _ocrInstallTimer.Dispose();
                 }
             }
 

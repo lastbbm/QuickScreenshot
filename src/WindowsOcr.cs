@@ -88,6 +88,18 @@ namespace QuickScreenshot
             public double Bottom;
         }
 
+        private sealed class EngineLine
+        {
+            public LineBlock Block;
+            public string LanguageName;
+        }
+
+        private sealed class BlockCluster
+        {
+            public LineBlock Representative;
+            public readonly List<EngineLine> Lines = new List<EngineLine>();
+        }
+
         private sealed class PreparedImage : IDisposable
         {
             public readonly Bitmap Bitmap;
@@ -173,7 +185,8 @@ namespace QuickScreenshot
                 outcome.LineCount = best.LineCount;
                 outcome.CharCount = best.CharCount;
                 outcome.LanguageName = best.LanguageName;
-                outcome.SuggestEnglishOcr = !englishAvailable && ContainsLatin(best.Text);
+                outcome.SuggestEnglishOcr = !englishAvailable &&
+                    (ContainsLatin(best.Text) || best.LineCount <= 1);
                 outcome.Success = true;
                 return outcome;
             }
@@ -204,6 +217,31 @@ namespace QuickScreenshot
             }
 
             return candidate.CharCount > current.CharCount;
+        }
+
+        public static bool IsRecognizerInstalled(string languagePrefix)
+        {
+            if (string.IsNullOrEmpty(languagePrefix))
+            {
+                return false;
+            }
+
+            try
+            {
+                foreach (Language language in OcrEngine.AvailableRecognizerLanguages)
+                {
+                    string tag = language.LanguageTag ?? string.Empty;
+                    if (tag.StartsWith(languagePrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
         }
 
         private static List<EngineInfo> CreateEngines(string preferredCulture, out bool englishAvailable)
@@ -335,7 +373,7 @@ namespace QuickScreenshot
             try
             {
                 softwareBitmap = CreateSoftwareBitmap(bitmap);
-                Candidate best = null;
+                List<EngineLine> allLines = new List<EngineLine>();
                 for (int i = 0; i < engines.Count; i++)
                 {
                     OcrResult result;
@@ -354,31 +392,156 @@ namespace QuickScreenshot
                         continue;
                     }
 
-                    int lineCount;
-                    string text = NormalizeLines(result, out lineCount);
-                    if (string.IsNullOrEmpty(text))
+                    List<LineBlock> blocks = ExtractLineBlocks(result);
+                    for (int j = 0; j < blocks.Count; j++)
                     {
-                        continue;
-                    }
-
-                    Candidate candidate = new Candidate();
-                    candidate.Text = text;
-                    candidate.LineCount = lineCount;
-                    candidate.CharCount = text.Replace("\r", "").Replace("\n", "").Length;
-                    candidate.Score = ScoreText(text);
-                    candidate.LanguageName = engines[i].Name;
-                    if (IsBetter(candidate, best))
-                    {
-                        best = candidate;
+                        EngineLine line = new EngineLine();
+                        line.Block = blocks[j];
+                        line.LanguageName = engines[i].Name;
+                        allLines.Add(line);
                     }
                 }
 
-                return best;
+                return MergeEngineLines(allLines);
             }
             finally
             {
                 CloseWinRt(softwareBitmap);
             }
+        }
+
+        private static Candidate MergeEngineLines(List<EngineLine> allLines)
+        {
+            if (allLines == null || allLines.Count == 0)
+            {
+                return null;
+            }
+
+            allLines.Sort(delegate(EngineLine a, EngineLine b)
+            {
+                return a.Block.Top.CompareTo(b.Block.Top);
+            });
+
+            List<BlockCluster> clusters = new List<BlockCluster>();
+            for (int i = 0; i < allLines.Count; i++)
+            {
+                EngineLine line = allLines[i];
+                BlockCluster cluster = null;
+                for (int j = 0; j < clusters.Count; j++)
+                {
+                    if (IsSameVisualLine(clusters[j].Representative, line.Block))
+                    {
+                        cluster = clusters[j];
+                        break;
+                    }
+                }
+
+                if (cluster == null)
+                {
+                    cluster = new BlockCluster();
+                    cluster.Representative = line.Block;
+                    clusters.Add(cluster);
+                }
+
+                cluster.Lines.Add(line);
+            }
+
+            clusters.Sort(delegate(BlockCluster a, BlockCluster b)
+            {
+                return a.Representative.Top.CompareTo(b.Representative.Top);
+            });
+
+            StringBuilder builder = new StringBuilder();
+            int lineCount = 0;
+            HashSet<string> languages = new HashSet<string>();
+            for (int i = 0; i < clusters.Count; i++)
+            {
+                BlockCluster cluster = clusters[i];
+                EngineLine selected = null;
+                int selectedScore = int.MinValue;
+                for (int j = 0; j < cluster.Lines.Count; j++)
+                {
+                    EngineLine line = cluster.Lines[j];
+                    int score = ScoreBlock(line.Block);
+                    if (score > selectedScore)
+                    {
+                        selected = line;
+                        selectedScore = score;
+                    }
+                }
+
+                if (selected == null || string.IsNullOrEmpty(selected.Block.Text))
+                {
+                    continue;
+                }
+
+                if (builder.Length > 0)
+                {
+                    builder.AppendLine();
+                }
+
+                builder.Append(selected.Block.Text);
+                lineCount++;
+                if (!string.IsNullOrEmpty(selected.LanguageName))
+                {
+                    languages.Add(selected.LanguageName);
+                }
+            }
+
+            if (builder.Length == 0)
+            {
+                return null;
+            }
+
+            string text = builder.ToString();
+            Candidate candidate = new Candidate();
+            candidate.Text = text;
+            candidate.LineCount = lineCount;
+            candidate.CharCount = text.Replace("\r", "").Replace("\n", "").Length;
+            candidate.Score = ScoreText(text);
+            candidate.LanguageName = languages.Count > 1
+                ? "多语言"
+                : (languages.Count == 1 ? GetFirst(languages) : "Windows OCR");
+            return candidate;
+        }
+
+        private static string GetFirst(HashSet<string> values)
+        {
+            foreach (string value in values)
+            {
+                return value;
+            }
+
+            return "Windows OCR";
+        }
+
+        private static int ScoreBlock(LineBlock block)
+        {
+            int score = ScoreText(block.Text);
+            if (ContainsCjk(block.Text))
+            {
+                score += 5;
+            }
+
+            return score;
+        }
+
+        private static bool ContainsCjk(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < text.Length; i++)
+            {
+                if (IsCjk(text[i]))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static int ScoreText(string text)
@@ -805,15 +968,14 @@ namespace QuickScreenshot
             return operation.GetResults();
         }
 
-        private static string NormalizeLines(OcrResult result, out int lineCount)
+        private static List<LineBlock> ExtractLineBlocks(OcrResult result)
         {
-            lineCount = 0;
+            List<LineBlock> blocks = new List<LineBlock>();
             if (result == null)
             {
-                return string.Empty;
+                return blocks;
             }
 
-            List<LineBlock> blocks = new List<LineBlock>();
             try
             {
                 foreach (OcrLine line in result.Lines)
@@ -856,27 +1018,26 @@ namespace QuickScreenshot
                 string raw = NormalizeLineText(result.Text);
                 if (raw.Length > 0)
                 {
-                    lineCount = 1;
-                    return raw;
+                    LineBlock block = new LineBlock();
+                    block.Text = raw;
+                    block.Left = 0;
+                    block.Top = 0;
+                    block.Right = 0;
+                    block.Bottom = 0;
+                    blocks.Add(block);
                 }
 
-                return string.Empty;
+                return blocks;
             }
 
-            StringBuilder builder = new StringBuilder();
-            LineBlock previous = null;
+            List<LineBlock> merged = new List<LineBlock>();
             for (int i = 0; i < blocks.Count; i++)
             {
                 LineBlock block = blocks[i];
-                if (previous != null && IsSameVisualLine(previous, block))
+                if (merged.Count > 0 && IsSameVisualLine(merged[merged.Count - 1], block))
                 {
+                    LineBlock previous = merged[merged.Count - 1];
                     bool insertSpace = !EndsWithCjk(previous.Text) || !StartsWithCjk(block.Text);
-                    if (insertSpace)
-                    {
-                        builder.Append(' ');
-                    }
-
-                    builder.Append(block.Text);
                     previous.Text = insertSpace
                         ? previous.Text + " " + block.Text
                         : previous.Text + block.Text;
@@ -887,22 +1048,10 @@ namespace QuickScreenshot
                     continue;
                 }
 
-                if (builder.Length > 0)
-                {
-                    builder.AppendLine();
-                    lineCount++;
-                }
-
-                builder.Append(block.Text);
-                previous = block;
+                merged.Add(block);
             }
 
-            if (builder.Length > 0)
-            {
-                lineCount++;
-            }
-
-            return builder.ToString();
+            return merged;
         }
 
         private static bool IsSameVisualLine(LineBlock a, LineBlock b)
